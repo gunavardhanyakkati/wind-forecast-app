@@ -27,14 +27,16 @@ ChartJS.register(
 );
 
 export default function App() {
-  // Default values: Jan 1st 2025 to Jan 2nd 2025
+  // Hardcoding some defaults for now to make testing easier
   const defaultStart = '2025-01-01T00:00';
   const defaultEnd = '2025-01-02T00:00';
 
   const [start, setStart] = useState(defaultStart);
   const [end, setEnd] = useState(defaultEnd);
-  const [horizon, setHorizon] = useState(4);
+  // default horizon of 4 hours
+  const [horizon, setHorizon] = useState(4); 
   const [chartData, setChartData] = useState([]);
+  
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
@@ -42,7 +44,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      // Ensure ISO format for API
+      // Make sure we send proper ISO strings to the backend API
       const startIso = new Date(start).toISOString();
       const endIso = new Date(end).toISOString();
       
@@ -50,24 +52,26 @@ export default function App() {
         params: {
           start: startIso,
           end: endIso,
-          horizon: horizon
+          // TODO: maybe validate horizon isn't negative before sending?
+          horizon
         }
       });
       
       setChartData(response.data.data);
     } catch (err) {
-      console.error(err);
-      setError(err.response?.data?.error || 'Failed to fetch data');
+      console.error("fetchData error:", err);
+      setError(err.response?.data?.error || 'Failed to fetch data from backend');
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
+    // Only fetch if we have both dates
     if (start && end) {
       fetchData();
     }
-    // eslint-disable-next-line
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [start, end, horizon]);
 
   const dataConfig = {

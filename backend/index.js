@@ -9,36 +9,38 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Filter data manually based on 'horizon' parameter (in hours)
-function filterForecasts(forecasts, targetTimeStr, horizonHours) {
-    const targetTime = new Date(targetTimeStr).getTime();
-    const cutoffTime = targetTime - (horizonHours * 60 * 60 * 1000); // T - H
+// Helper to grab the most recently published forecast for a given time
+// making sure it was published before our H-hour horizon cutoff.
+const getLatestForecast = (forecastList, targetTimeStr, horizonHrs) => {
+    const targetMs = new Date(targetTimeStr).getTime();
+    const cutoffMs = targetMs - (horizonHrs * 60 * 60 * 1000); // T minus H
 
-    let latestForecast = null;
-    let maxPublishTime = -1;
+    let latest = null;
+    let maxPubMs = -1;
 
-    for (const f of forecasts) {
-        const fStartTime = new Date(f.startTime).getTime();
-        // Compare target time
-        if (fStartTime === targetTime) {
-            const pubTime = new Date(f.publishTime).getTime();
-            // forecast publish time must be <= cutoffTime
-            if (pubTime <= cutoffTime) {
-                if (pubTime > maxPublishTime) {
-                    maxPublishTime = pubTime;
-                    latestForecast = f;
-                }
+    for (let f of forecastList) {
+        const startMs = new Date(f.startTime).getTime();
+        
+        if (startMs === targetMs) {
+            const pubMs = new Date(f.publishTime).getTime();
+            // Did it come out before our cutoff?
+            if (pubMs <= cutoffMs && pubMs > maxPubMs) {
+                maxPubMs = pubMs;
+                latest = f;
             }
         }
     }
-    return latestForecast;
-}
+    return latest;
+};
 
+// Main data fetching endpoint
 app.get('/api/data', async (req, res) => {
     try {
         const { start, end, horizon } = req.query;
+        
+        // Bail out if anything is missing
         if (!start || !end || horizon === undefined) {
-            return res.status(400).json({ error: 'Missing parameters' });
+            return res.status(400).json({ error: 'Missing required query params (start, end, horizon)' });
         }
 
         const horizonHours = parseFloat(horizon);
@@ -47,17 +49,18 @@ app.get('/api/data', async (req, res) => {
         const startSettlement = start.substring(0, 10);
         const endSettlement = end.substring(0, 10);
 
-        // Fetch Actuals specifically bounded by settlementDate
+        // Fetch Actuals bounded by settlementDate
         const actualsResponse = await axios.get(`https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH?settlementDateFrom=${startSettlement}&settlementDateTo=${endSettlement}`);
-        // The Elexon Insights API returns { data: [...] } instead of an array directly on the root
+        // Elexon's API nests the payload inside a 'data' array
         const allActuals = actualsResponse.data.data || [];
 
-        // Fetch Forecasts: Forecasts for the target "start" time could be published up to "horizon" hours BEFORE "start".
-        // Adding 12 hours buffer to the horizon to ensure we catch the forecast.
-        // WINDFOR requires publishDateTimeFrom and publishDateTimeTo!
+        // WINDFOR expects publish time filters, not target time.
+        // Pad the start time backwards by (horizon + 12h) just to be safe and catch early publications.
         const startDate = new Date(start);
         const bufferedStartMs = startDate.getTime() - ((horizonHours + 12) * 60 * 60 * 1000);
+        
         const bufferedStart = new Date(bufferedStartMs).toISOString();
+        // End time can technically just be 'end'
         const bufferedEnd = end;
 
         console.log(`Fetching actuals from ${startSettlement} to ${endSettlement}`);
@@ -70,13 +73,14 @@ app.get('/api/data', async (req, res) => {
 
         const actualsMap = {};
         
+        // Build a lookup map for actuals by timestamp
         if (Array.isArray(allActuals)) {
-             allActuals.forEach(item => {
+             for (const item of allActuals) {
                 if (item.fuelType === 'WIND') {
-                    // Save by string for simplicity if it matches precisely, but we'll use timestamp to be safe
+                    // Timestamp in ms is safer than comparing raw ISO strings
                     actualsMap[new Date(item.startTime).getTime()] = item;
                 }
-             });
+             }
         }
 
         const combinedData = [];
@@ -89,7 +93,7 @@ app.get('/api/data', async (req, res) => {
             // Only plot values within the exact requested UI bounds (since settlementDate gets full day)
             if (tTime >= targetTimeWindowStart && tTime <= targetTimeWindowEnd) {
                 let actualItem = actualsMap[tTime];
-                let matchedForecast = filterForecasts(allForecasts, actualItem.startTime, horizonHours);
+                let matchedForecast = getLatestForecast(allForecasts, actualItem.startTime, horizonHours);
 
                 if (matchedForecast) {
                     combinedData.push({
@@ -102,14 +106,14 @@ app.get('/api/data', async (req, res) => {
             }
         }
 
-        console.log(`Combining mapped points: ${combinedData.length}`);
+        console.log(`Successfully mapped ${combinedData.length} data points.`);
         
         res.json({ data: combinedData });
 
-    } catch (error) {
-        console.error("Error fetching data:", error.message);
-        // Error handling if response size exceeded or gateway timeout
-        res.status(500).json({ error: 'Failed', details: error.response?.data || error.message });
+    } catch (err) {
+        console.error("Failed to fetch from Elexon:", err.message);
+        // Sometimes Elexon just times out or returns huge payloads, pass it along
+        res.status(500).json({ error: 'Data fetch failed', details: err.response?.data || err.message });
     }
 });
 
