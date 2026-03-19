@@ -9,9 +9,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Proxy endpoints for BMRS API
-const BMRS_API_BASE = 'https://bmrs.elexon.co.uk/api-documentation/endpoint/datasets';
-
 // Filter data manually based on 'horizon' parameter (in hours)
 function filterForecasts(forecasts, targetTimeStr, horizonHours) {
     const targetTime = new Date(targetTimeStr).getTime();
@@ -21,10 +18,11 @@ function filterForecasts(forecasts, targetTimeStr, horizonHours) {
     let maxPublishTime = -1;
 
     for (const f of forecasts) {
-        // Find forecasts matching the exact same target time
-        if (f.startTime === targetTimeStr) {
+        const fStartTime = new Date(f.startTime).getTime();
+        // Compare target time
+        if (fStartTime === targetTime) {
             const pubTime = new Date(f.publishTime).getTime();
-            // publishTime <= targetTime - horizon
+            // forecast publish time must be <= cutoffTime
             if (pubTime <= cutoffTime) {
                 if (pubTime > maxPublishTime) {
                     maxPublishTime = pubTime;
@@ -40,68 +38,78 @@ app.get('/api/data', async (req, res) => {
     try {
         const { start, end, horizon } = req.query;
         if (!start || !end || horizon === undefined) {
-            return res.status(400).json({ error: 'Missing start, end, or horizon query parameters' });
+            return res.status(400).json({ error: 'Missing parameters' });
         }
 
         const horizonHours = parseFloat(horizon);
 
-        // Fetch Actuals
-        // Usually BMRS stream APIs require some standard datetime format, e.g. YYYY-MM-DD
-        const actualsUrl = `https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH/stream?publishTimeFrom=${start}&publishTimeTo=${end}`;
-        console.log(`Fetching actuals from: ${actualsUrl}`);
+        // API parameters require simple YYYY-MM-DD for settlementDate
+        const startSettlement = start.substring(0, 10);
+        const endSettlement = end.substring(0, 10);
+
+        // Fetch Actuals specifically bounded by settlementDate
+        const actualsResponse = await axios.get(`https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH?settlementDateFrom=${startSettlement}&settlementDateTo=${endSettlement}`);
+        // The Elexon Insights API returns { data: [...] } instead of an array directly on the root
+        const allActuals = actualsResponse.data.data || [];
+
+        // Fetch Forecasts: Forecasts for the target "start" time could be published up to "horizon" hours BEFORE "start".
+        // Adding 12 hours buffer to the horizon to ensure we catch the forecast.
+        // WINDFOR requires publishDateTimeFrom and publishDateTimeTo!
+        const startDate = new Date(start);
+        const bufferedStartMs = startDate.getTime() - ((horizonHours + 12) * 60 * 60 * 1000);
+        const bufferedStart = new Date(bufferedStartMs).toISOString();
+        const bufferedEnd = end;
+
+        console.log(`Fetching actuals from ${startSettlement} to ${endSettlement}`);
+        console.log(`Fetching forecasts from ${bufferedStart} to ${bufferedEnd}`);
+
+        const forecastsResponse = await axios.get(`https://data.elexon.co.uk/bmrs/api/v1/datasets/WINDFOR?publishDateTimeFrom=${bufferedStart}&publishDateTimeTo=${bufferedEnd}`);
+        const allForecasts = forecastsResponse.data.data || [];
         
-        // Let's actually use the endpoint the user provided but it seems to be /stream endpoint
-        // BMRS API Documentation link user provided: https://bmrs.elexon.co.uk/api-documentation/endpoint/datasets/FUELHH/stream
-        // Note: The new BMRS API (Elexon Insights) uses data.elexon.co.uk
-        const actualsResponse = await axios.get(`https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH/stream?publishTimeFrom=${start}&publishTimeTo=${end}`);
-        const allActuals = actualsResponse.data;
+        console.log(`Received ${allActuals.length} actuals and ${allForecasts.length} forecasts.`);
 
-        // Fetch Forecasts
-        const forecastsResponse = await axios.get(`https://data.elexon.co.uk/bmrs/api/v1/datasets/WINDFOR/stream?publishTimeFrom=${start}&publishTimeTo=${end}`);
-        const allForecasts = forecastsResponse.data;
-
-        // Process data
         const actualsMap = {};
         
-        // Filter actuals for WIND only
         if (Array.isArray(allActuals)) {
              allActuals.forEach(item => {
                 if (item.fuelType === 'WIND') {
-                    // Normalize target time
-                    actualsMap[item.startTime] = item.generation;
+                    // Save by string for simplicity if it matches precisely, but we'll use timestamp to be safe
+                    actualsMap[new Date(item.startTime).getTime()] = item;
                 }
              });
         }
 
         const combinedData = [];
+        const targetTimeWindowStart = new Date(start).getTime();
+        const targetTimeWindowEnd = new Date(end).getTime();
 
-        // For each actual target time, find the corresponding latest forecast
-        const uniqueTargetTimes = Object.keys(actualsMap).sort();
+        const uniqueTargetTimes = Object.keys(actualsMap).map(Number).sort((a,b) => a - b);
 
         for (const tTime of uniqueTargetTimes) {
-            let actualGen = actualsMap[tTime];
-            let matchedForecast = filterForecasts(allForecasts, tTime, horizonHours);
+            // Only plot values within the exact requested UI bounds (since settlementDate gets full day)
+            if (tTime >= targetTimeWindowStart && tTime <= targetTimeWindowEnd) {
+                let actualItem = actualsMap[tTime];
+                let matchedForecast = filterForecasts(allForecasts, actualItem.startTime, horizonHours);
 
-            if (matchedForecast) {
-                combinedData.push({
-                    targetTime: tTime,
-                    actualGeneration: actualGen,
-                    forecastGeneration: matchedForecast.generation,
-                    forecastPublishTime: matchedForecast.publishTime
-                });
-            } else {
-                // If there's no valid forecast matching the rule, don't plot any values (per requirements)
-                // We'll exclude this data point or put null depending on chart preference. Let's exclude.
+                if (matchedForecast) {
+                    combinedData.push({
+                        targetTime: actualItem.startTime, 
+                        actualGeneration: actualItem.generation,
+                        forecastGeneration: matchedForecast.generation,
+                        forecastPublishTime: matchedForecast.publishTime
+                    });
+                }
             }
         }
 
-        res.json({
-            data: combinedData
-        });
+        console.log(`Combining mapped points: ${combinedData.length}`);
+        
+        res.json({ data: combinedData });
 
     } catch (error) {
         console.error("Error fetching data:", error.message);
-        res.status(500).json({ error: 'Failed to fetch external data', details: error.message });
+        // Error handling if response size exceeded or gateway timeout
+        res.status(500).json({ error: 'Failed', details: error.response?.data || error.message });
     }
 });
 

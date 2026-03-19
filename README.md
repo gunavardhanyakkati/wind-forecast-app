@@ -36,6 +36,3 @@ cd analysis
 pip install pandas numpy matplotlib seaborn requests jupyter
 jupyter notebook wind_forecast_analysis.ipynb
 ```
-
-## AI Tools Used
-- Google Gemini 2.5 Pro (via Antigravity workspace integration) was used to bootstrap the React application boilerplate, the backend Express routing logic, and format the Jupyter JSON. Analytical conclusions and horizon logic were authored from first-principles reasoning according to user specifications.
